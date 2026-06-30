@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
+import pathlib
+import subprocess
 import sys
 
 from dotenv import load_dotenv
@@ -81,6 +84,109 @@ def _render_user_template(company: str = "AAPL") -> str:
 console = Console()
 
 
+# ---------------------------------------------------------------------------
+# /pdf 命令相关：解析 HKEX 新股 PDF
+# ---------------------------------------------------------------------------
+
+HERE = pathlib.Path(__file__).resolve().parent
+EXTRACT_SCRIPT = HERE / "skills" / "hk-ipo-pdf-extractor" / "scripts" / "extract.py"
+DEFAULT_LISTINGS_TSV = HERE / "output" / "hkex_listings.tsv"
+
+
+def _resolve_pdf_url(arg: str) -> tuple[str, str] | None:
+    """根据参数解析 PDF URL。返回 (url, label)，失败返回 None。
+
+    支持三种形式：
+      1. http(s)://...  → URL 直接用
+      2. 纯数字          → DEFAULT_LISTINGS_TSV 第 N 行
+      3. 其他字符串      → 在 TSV 里模糊匹配公司名
+    """
+    arg = arg.strip()
+    if not arg:
+        return None
+
+    if arg.startswith(("http://", "https://")):
+        return arg, arg
+
+    if not DEFAULT_LISTINGS_TSV.exists():
+        console.print(f"[red]找不到 {DEFAULT_LISTINGS_TSV}，请先跑 python3 spider.py[/red]")
+        return None
+
+    rows = [
+        line.split("\t")
+        for line in DEFAULT_LISTINGS_TSV.read_text(encoding="utf-8").splitlines()
+        if line.count("\t") >= 2
+    ]
+    if not rows:
+        console.print("[red]TSV 为空[/red]")
+        return None
+
+    # 纯数字 → 行号
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(rows):
+            code, name, url = rows[idx][0], rows[idx][1], rows[idx][2]
+            return url, f"#{arg} {code} {name}"
+        console.print(f"[red]行号超出范围（共 {len(rows)} 行）[/red]")
+        return None
+
+    # 否则模糊匹配公司名 / 代码
+    needle = arg.lower()
+    for code, name, url in rows:
+        if needle in name.lower() or needle in code.lower():
+            return url, f"{code} {name}"
+    console.print(f"[red]在 TSV 中找不到匹配 '{arg}' 的公司[/red]")
+    return None
+
+
+def _run_pdf_extract(pdf_url: str) -> dict | None:
+    """调 hk-ipo-pdf-extractor 抽取，stdout 是 JSON，返回 dict。"""
+    if not EXTRACT_SCRIPT.exists():
+        console.print(f"[red]找不到抽取脚本: {EXTRACT_SCRIPT}[/red]")
+        return None
+
+    console.print(f"[dim]正在抽取 {pdf_url} ...[/dim]")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(EXTRACT_SCRIPT), pdf_url],
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        console.print("[red]抽取超时（>10 分钟）[/red]")
+        return None
+
+    if proc.returncode != 0:
+        console.print(f"[red]抽取失败 (exit {proc.returncode}):[/red]")
+        console.print(f"[red]{proc.stderr[:500]}[/red]")
+        return None
+
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]解析 JSON 失败: {e}[/red]")
+        return None
+
+
+def _format_extract_for_context(data: dict) -> str:
+    """把抽取结果格式化成可读文本，送进 LLM 上下文。"""
+    lines = ["【港股新股 PDF 抽取结果（hk-ipo-pdf-extractor）】"]
+    for k in (
+        "stock_code", "company_name_en", "company_name_cn", "document_type",
+        "offer_price_min", "offer_price_max", "final_offer_price",
+        "board_lot", "one_lot_entry_fee_hkd",
+        "application_start", "application_deadline",
+        "allotment_result_time", "listing_time", "source_url",
+    ):
+        v = data.get(k)
+        if v is not None:
+            lines.append(f"- {k}: {v}")
+    if data.get("evidence_summary"):
+        lines.append(f"\n抽取说明: {data['evidence_summary']}")
+    if data.get("_parse_error"):
+        lines.append(f"\n[警告] JSON 解析异常: {data['_parse_error']}")
+    return "\n".join(lines)
+
+
 def main() -> int:
     load_dotenv()
     try:
@@ -95,7 +201,8 @@ def main() -> int:
         Panel.fit(
             f"[bold]AI-assistant[/bold] · 模型 {client.model}\n"
             "输入内容直接回车发送 · /clear 清空 · /quit 退出 · "
-            "/template [公司] 注入股票分析模板",
+            "/template [公司] 注入股票分析模板 · "
+            "/pdf <URL|行号|公司> 抽取港股 PDF",
             border_style="cyan",
         )
     )
@@ -127,8 +234,52 @@ def main() -> int:
                     border_style="yellow",
                 )
             )
+        elif user_input.startswith("/pdf"):
+            parts = user_input.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) == 2 else ""
+            resolved = _resolve_pdf_url(arg)
+            if not resolved:
+                continue
+            pdf_url, label = resolved
+            data = _run_pdf_extract(pdf_url)
+            if not data:
+                continue
+            # 预览
+            console.print(
+                Panel(
+                    _format_extract_for_context(data),
+                    title=f"已抽取 · {label}",
+                    border_style="magenta",
+                )
+            )
+            # 拼到 messages 里，让模型基于结构化数据回答
+            user_input = (
+                f"以下是用户调 /pdf {arg} 抽取出来的港股 PDF 结构化数据：\n\n"
+                + _format_extract_for_context(data)
+                + "\n\n请基于以上数据，向用户介绍这只新股。"
+            )
 
         messages.append({"role": "user", "content": user_input})
+
+        # ---- debug: 打印即将发出去的请求体 ----
+        try:
+            payload = client.build_payload(messages)  # type: ignore[attr-defined]
+            console.print(
+                Panel(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    title="[dim]→ 请求体[/dim]",
+                    border_style="dim",
+                )
+            )
+        except AttributeError:
+            # 如果 MiniMaxClient 没暴露 build_payload，就退化为打印 messages
+            console.print(
+                Panel(
+                    json.dumps(messages, ensure_ascii=False, indent=2),
+                    title="[dim]→ messages[/dim]",
+                    border_style="dim",
+                )
+            )
 
         console.print(f"[bold cyan]{client.model}[/bold cyan] › ", end="")
         try:
